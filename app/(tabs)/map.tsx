@@ -1,5 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -16,12 +16,7 @@ import {
   Vibration,
   View,
 } from "react-native";
-import MapView, {
-  Circle,
-  Marker,
-  Polyline,
-  PROVIDER_GOOGLE,
-} from "react-native-maps";
+import OpenStreetMapView from "../../components/OpenStreetMapView";
 import { auth } from "../../firebase";
 import {
   rateUser,
@@ -43,45 +38,22 @@ import { playSOSAlert, stopSOSAlert } from "../../utils/alertSystem";
 import { sendLocalNotification } from "../../utils/notifications";
 import type { LatLng, MapUser } from "../../types/domain";
 
-const DEFAULT_REGION_DELTA = 0.012;
 const SOS_FRESH_MS = 3 * 60 * 1000;
+const FALLBACK_LOCATION: LatLng = { latitude: 12.9716, longitude: 77.5946 };
 
-const hospitalMarker = require("../../assets/default-marker-online.png");
 const defaultUser = require("../../assets/default-user.png");
-const greenDotMarker = require("../../assets/marker-dot-green.png");
-const redDotMarker = require("../../assets/marker-dot-red.png");
-const redDarkDotMarker = require("../../assets/marker-dot-red-dark.png");
-
-const HospitalMarker = memo(function HospitalMarker({
-  hospital,
-  onPress,
-}: {
-  hospital: Hospital;
-  onPress: (hospital: Hospital) => void;
-}) {
-  return (
-    <Marker
-      identifier={`hospital-${hospital.id}`}
-      coordinate={{ latitude: hospital.lat, longitude: hospital.lng }}
-      image={hospitalMarker}
-      anchor={{ x: 0.5, y: 0.5 }}
-      tracksViewChanges={false}
-      zIndex={5}
-      onPress={() => onPress(hospital)}
-    />
-  );
-});
 
 export default function MapScreen() {
   const currentUser = auth.currentUser;
-  const mapRef = useRef<MapView | null>(null);
   const handledSOSRef = useRef<Record<string, number>>({});
   const shortcutTapRef = useRef<number[]>([]);
+  const didCenterOnGpsRef = useRef(false);
 
   const { location, permissionDenied } = useCurrentLocationPresence();
+  const currentLocation = location ?? FALLBACK_LOCATION;
   const profiles = useProfiles();
   const liveLocations = useLiveLocations();
-  const { alerts, toggleSOS, clearSOS } = useSosController(location);
+  const { alerts, toggleSOS, clearSOS } = useSosController(currentLocation);
   const { incoming, activeCall, updateCall, endCall } = useIncomingCalls();
 
   const [selectedUser, setSelectedUser] = useState<MapUser | null>(null);
@@ -91,6 +63,7 @@ export default function MapScreen() {
   const [hospitalPanelOpen, setHospitalPanelOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [outgoingCallId, setOutgoingCallId] = useState<string | null>(null);
+  const [mapFocus, setMapFocus] = useState<(LatLng & { zoom?: number; nonce: number }) | null>(null);
   const [route, setRoute] = useState<LatLng[]>([]);
   const [pulse, setPulse] = useState(0);
   const { call: outgoingCall, endCall: endOutgoingCall } = useOutgoingCall(outgoingCallId);
@@ -100,7 +73,7 @@ export default function MapScreen() {
   );
 
   const mapUsers = useMemo<MapUser[]>(() => {
-    return liveLocations.map((live) => {
+    const others = liveLocations.map((live) => {
       const activeSOS = alerts[live.id];
       const isSOS = Boolean(activeSOS && Date.now() - activeSOS.time < SOS_FRESH_MS);
       const profile = profiles[live.id];
@@ -111,7 +84,28 @@ export default function MapScreen() {
         isSOS,
       };
     });
-  }, [alerts, liveLocations, profiles]);
+
+    if (!currentUser) return others;
+
+    const myActiveSOS = alerts[currentUser.uid];
+    const me: MapUser = {
+      id: currentUser.uid,
+      latitude: currentLocation.latitude,
+      longitude: currentLocation.longitude,
+      updatedAt: Date.now(),
+      profile: profiles[currentUser.uid],
+      isSOS: Boolean(myActiveSOS && Date.now() - myActiveSOS.time < SOS_FRESH_MS),
+      isCurrentUser: true,
+    };
+
+    return [me, ...others.filter((user) => user.id !== currentUser.uid)];
+  }, [alerts, currentLocation, currentUser, liveLocations, profiles]);
+
+  useEffect(() => {
+    if (!location || didCenterOnGpsRef.current) return;
+    didCenterOnGpsRef.current = true;
+    focusOn(location, 17);
+  }, [location]);
 
   useEffect(() => {
     if (!incoming) return;
@@ -137,18 +131,18 @@ export default function MapScreen() {
   }, [selectedHospital, selectedUser]);
 
   const navigationMeta = useMemo(() => {
-    if (!location || !selectedTarget) return null;
+    if (!selectedTarget) return null;
 
     return {
-      distance: formatDistance(distanceBetween(location, selectedTarget)),
-      bearing: bearingBetween(location, selectedTarget),
+      distance: formatDistance(distanceBetween(currentLocation, selectedTarget)),
+      bearing: bearingBetween(currentLocation, selectedTarget),
     };
-  }, [location, selectedTarget]);
+  }, [currentLocation, selectedTarget]);
 
   useEffect(() => {
     const interval = setInterval(() => {
       setPulse((value) => (value + 1) % 3);
-    }, 850);
+    }, 450);
 
     return () => clearInterval(interval);
   }, []);
@@ -169,13 +163,7 @@ export default function MapScreen() {
       );
       Vibration.vibrate([0, 700, 250, 700]);
 
-      mapRef.current?.animateCamera(
-        {
-          center: { latitude: sos.latitude, longitude: sos.longitude },
-          zoom: 17,
-        },
-        { duration: 700 }
-      );
+      focusOn({ latitude: sos.latitude, longitude: sos.longitude }, 17);
 
       Alert.alert(
         "SOS Alert",
@@ -194,16 +182,14 @@ export default function MapScreen() {
     });
   }, [alerts, currentUser, mapUsers, profiles]);
 
-  async function loadHospitals() {
-    if (!location) return;
-
+  async function loadHospitals(origin: LatLng = currentLocation) {
     setHospitalLoading(true);
     setHospitalPanelOpen(true);
 
     try {
       const data = await fetchNearbyHospitals(
-        location.latitude,
-        location.longitude,
+        origin.latitude,
+        origin.longitude,
         5000
       );
       setHospitals(data);
@@ -215,7 +201,7 @@ export default function MapScreen() {
   }
 
   function focusOn(target: LatLng, zoom = 16) {
-    mapRef.current?.animateCamera({ center: target, zoom }, { duration: 550 });
+    setMapFocus({ ...target, zoom, nonce: Date.now() });
   }
 
   function selectUser(user: MapUser) {
@@ -233,8 +219,8 @@ export default function MapScreen() {
   }
 
   function drawRoute() {
-    if (!location || !selectedTarget) return;
-    setRoute(buildStraightLineRoute(location, selectedTarget));
+    if (!selectedTarget) return;
+    setRoute(buildStraightLineRoute(currentLocation, selectedTarget));
   }
 
   async function startCall() {
@@ -252,6 +238,16 @@ export default function MapScreen() {
     Alert.alert("Calling", "The helper will see your call request in the app.");
   }
 
+  async function triggerSOSAndHospitals() {
+    if (!mySOSActive) {
+      Vibration.vibrate([0, 120, 80, 220]);
+      focusOn(currentLocation, 17);
+      loadHospitals(currentLocation);
+    }
+
+    await toggleSOS("Emergency help needed");
+  }
+
   function handleShortcutTap() {
     const time = Date.now();
     shortcutTapRef.current = [...shortcutTapRef.current, time].filter(
@@ -261,7 +257,7 @@ export default function MapScreen() {
     if (shortcutTapRef.current.length >= 3) {
       shortcutTapRef.current = [];
       if (!mySOSActive) {
-        toggleSOS("Emergency help needed");
+        triggerSOSAndHospitals();
         Vibration.vibrate([0, 120, 80, 120, 80, 220]);
         sendLocalNotification("SOS triggered", "Emergency alert sent from shortcut.");
       }
@@ -280,97 +276,54 @@ export default function MapScreen() {
     );
   }
 
-  if (!location) {
-    return (
-      <View style={styles.centered}>
-        <ActivityIndicator size="large" color="#ef4444" />
-        <Text style={styles.centerCopy}>Locking on to your location...</Text>
-      </View>
-    );
-  }
-
   return (
     <View style={styles.screen}>
-      <MapView
-        ref={mapRef}
-        provider={PROVIDER_GOOGLE}
-        style={StyleSheet.absoluteFill}
-        initialRegion={{
-          latitude: location.latitude,
-          longitude: location.longitude,
-          latitudeDelta: DEFAULT_REGION_DELTA,
-          longitudeDelta: DEFAULT_REGION_DELTA,
+      <OpenStreetMapView
+        center={currentLocation}
+        users={mapUsers}
+        hospitals={hospitals}
+        alerts={activeAlerts}
+        route={route}
+        pulse={pulse}
+        focus={mapFocus}
+        onUserPress={(id) => {
+          const user = mapUsers.find((item) => item.id === id);
+          if (user) selectUser(user);
         }}
-        showsUserLocation
-        showsMyLocationButton={false}
-        moveOnMarkerPress={false}
-        toolbarEnabled={false}
-      >
-        {mapUsers.map((user) => {
-          const flashOn = user.isSOS && pulse % 2 === 0;
+        onHospitalPress={(id) => {
+          const hospital = hospitals.find((item) => item.id === id);
+          if (hospital) selectHospital(hospital);
+        }}
+      />
 
-          return (
-            <Marker
-              key={user.id}
-              identifier={`user-${user.id}`}
-              coordinate={{ latitude: user.latitude, longitude: user.longitude }}
-              image={
-                user.isSOS ? (flashOn ? redDotMarker : redDarkDotMarker) : greenDotMarker
-              }
-              anchor={{ x: 0.5, y: 0.5 }}
-              tracksViewChanges={false}
-              zIndex={user.isSOS ? 60 : 10}
-              onPress={() => selectUser(user)}
-            />
-          );
-        })}
-
-        {hospitals.map((hospital) => (
-          <HospitalMarker
-            key={hospital.id}
-            hospital={hospital}
-            onPress={selectHospital}
-          />
-        ))}
-
-        {activeAlerts.map((sos) => (
-          <Circle
-            key={sos.id}
-            center={{ latitude: sos.latitude, longitude: sos.longitude }}
-            radius={90 + pulse * 45}
-            strokeWidth={2}
-            strokeColor={`rgba(239, 68, 68, ${0.75 - pulse * 0.2})`}
-            fillColor={`rgba(239, 68, 68, ${0.18 - pulse * 0.04})`}
-            zIndex={40}
-          />
-        ))}
-
-        {route.length > 1 && (
-          <Polyline
-            coordinates={route}
-            strokeColor="#2563eb"
-            strokeWidth={5}
-            geodesic
-          />
-        )}
-      </MapView>
+      {!location && (
+        <View style={styles.locationBanner}>
+          <ActivityIndicator size="small" color="#ef4444" />
+          <Text style={styles.locationBannerText}>
+            Finding GPS. Showing approximate map for now.
+          </Text>
+        </View>
+      )}
 
       <View style={styles.topBar}>
         <TouchableOpacity
           style={styles.iconButton}
           onPress={() => {
             handleShortcutTap();
-            focusOn(location, 17);
+            focusOn(currentLocation, 17);
           }}
         >
           <Ionicons name="locate" size={22} color="#0f172a" />
         </TouchableOpacity>
-        <TouchableOpacity style={styles.iconButton} onPress={loadHospitals}>
+        <TouchableOpacity style={styles.iconButton} onPress={() => loadHospitals()}>
           <Ionicons name="medical" size={22} color="#0f172a" />
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.iconButton} onPress={stopSOSAlert}>
+          <Ionicons name="volume-mute" size={22} color="#0f172a" />
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.sosButton, mySOSActive && styles.sosButtonActive]}
-          onPress={() => toggleSOS("Emergency help needed")}
+          onPress={triggerSOSAndHospitals}
           onLongPress={clearSOS}
         >
           <Text style={styles.sosText}>{mySOSActive ? "STOP" : "SOS"}</Text>
@@ -727,6 +680,71 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#e2e8f0",
   },
+  safeMapFallback: {
+    flex: 1,
+    paddingTop: 142,
+    paddingHorizontal: 16,
+    backgroundColor: "#ecfdf5",
+  },
+  safeMapHeader: {
+    flexDirection: "row",
+    gap: 12,
+    padding: 14,
+    borderRadius: 8,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#bbf7d0",
+  },
+  safeMapTitle: {
+    color: "#0f172a",
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  safeMapCopy: {
+    marginTop: 4,
+    color: "#475569",
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  safeMapSection: {
+    marginTop: 18,
+    marginBottom: 8,
+    color: "#0f172a",
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  safeMapEmpty: {
+    padding: 14,
+    borderRadius: 8,
+    color: "#64748b",
+    backgroundColor: "#ffffff",
+  },
+  safeUserRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 8,
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: "#ffffff",
+  },
+  safeUserDot: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 3,
+    borderColor: "#ffffff",
+    backgroundColor: "#22c55e",
+  },
+  safeUserName: {
+    color: "#0f172a",
+    fontWeight: "900",
+  },
+  safeUserMeta: {
+    marginTop: 2,
+    color: "#64748b",
+    fontSize: 12,
+  },
   centered: {
     flex: 1,
     alignItems: "center",
@@ -756,6 +774,30 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
+  },
+  locationBanner: {
+    position: "absolute",
+    top: 132,
+    left: 16,
+    right: 16,
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    backgroundColor: "#ffffff",
+    elevation: 4,
+    shadowColor: "#000000",
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  locationBannerText: {
+    flex: 1,
+    color: "#334155",
+    fontSize: 12,
+    fontWeight: "800",
   },
   iconButton: {
     width: 46,

@@ -34,6 +34,7 @@ export type SosAlert = {
 export type MapUser = LiveLocation & {
   profile?: UserProfile;
   isSOS: boolean;
+  isCurrentUser?: boolean;
 };
 
 export type ChatMessage = {

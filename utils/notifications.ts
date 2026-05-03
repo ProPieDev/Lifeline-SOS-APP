@@ -12,31 +12,39 @@ Notifications.setNotificationHandler({
 });
 
 export async function registerForPushNotifications() {
-  if (!Device.isDevice) {
-    await Notifications.requestPermissionsAsync();
-    return;
+  try {
+    if (!Device.isDevice) {
+      await Notifications.requestPermissionsAsync();
+      return;
+    }
+
+    const existing = await Notifications.getPermissionsAsync();
+    const finalStatus =
+      existing.status === "granted"
+        ? existing.status
+        : (await Notifications.requestPermissionsAsync()).status;
+
+    if (finalStatus !== "granted") return;
+
+    const token = (await Notifications.getExpoPushTokenAsync()).data;
+    return token;
+  } catch (error) {
+    console.log("Notification registration skipped", error);
   }
-
-  const existing = await Notifications.getPermissionsAsync();
-  const finalStatus =
-    existing.status === "granted"
-      ? existing.status
-      : (await Notifications.requestPermissionsAsync()).status;
-
-  if (finalStatus !== "granted") return;
-
-  const token = (await Notifications.getExpoPushTokenAsync()).data;
-  return token;
 }
 
 export async function sendLocalNotification(title: string, body: string) {
-  await Notifications.scheduleNotificationAsync({
-    content: {
-      title,
-      body,
-      sound: true,
-      priority: Notifications.AndroidNotificationPriority.MAX,
-    },
-    trigger: null
-  });
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title,
+        body,
+        sound: true,
+        priority: Notifications.AndroidNotificationPriority.MAX,
+      },
+      trigger: null
+    });
+  } catch (error) {
+    console.log("Local notification skipped", error);
+  }
 }

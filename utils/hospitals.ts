@@ -25,7 +25,7 @@ const OVERPASS_ENDPOINTS = [
 export async function fetchNearbyHospitals(
   lat: number,
   lng: number,
-  radiusMeters = 2000
+  radiusMeters = 5000
 ): Promise<Hospital[]> {
   if (
     cache &&

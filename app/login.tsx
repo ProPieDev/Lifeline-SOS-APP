@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   View, Text, TextInput, TouchableOpacity,
   StyleSheet, Alert, Switch
@@ -10,17 +10,55 @@ import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword
 } from "firebase/auth";
+import {
+  loadRememberedCredentials,
+  saveRememberedCredentials
+} from "../utils/rememberMe";
 
 export default function LoginScreen() {
   const router = useRouter();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [remember, setRemember] = useState(false);
+  const [remember, setRemember] = useState(true);
+  const [loadingSaved, setLoadingSaved] = useState(true);
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function restoreLogin() {
+      const saved = await loadRememberedCredentials();
+      if (!mounted) return;
+
+      if (!saved) {
+        setLoadingSaved(false);
+        return;
+      }
+
+      setEmail(saved.email);
+      setPassword(saved.password);
+
+      try {
+        await signInWithEmailAndPassword(auth, saved.email, saved.password);
+        router.replace("/map");
+      } catch {
+        setLoadingSaved(false);
+      }
+    }
+
+    restoreLogin();
+
+    return () => {
+      mounted = false;
+    };
+  }, [router]);
 
   const login = async () => {
     try {
       await signInWithEmailAndPassword(auth, email, password);
+      if (remember) {
+        await saveRememberedCredentials(email, password);
+      }
       router.replace("/map");
     } catch (e:any) {
       Alert.alert(e.message);
@@ -30,11 +68,23 @@ export default function LoginScreen() {
   const signup = async () => {
     try {
       await createUserWithEmailAndPassword(auth, email, password);
+      if (remember) {
+        await saveRememberedCredentials(email, password);
+      }
       router.replace("/settings");
     } catch (e:any) {
       Alert.alert(e.message);
     }
   };
+
+  if (loadingSaved) {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Lifeline SOS</Text>
+        <Text style={styles.loadingText}>Checking saved login...</Text>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>
@@ -67,5 +117,6 @@ const styles = StyleSheet.create({
   btn:{backgroundColor:"#ef4444",padding:14,borderRadius:10},
   btnText:{color:"white",textAlign:"center"},
   btnOutline:{borderWidth:1,borderColor:"#ef4444",padding:14,borderRadius:10,marginTop:10},
-  btnOutlineText:{color:"#ef4444",textAlign:"center"}
+  btnOutlineText:{color:"#ef4444",textAlign:"center"},
+  loadingText:{color:"#cbd5e1",textAlign:"center"}
 });

@@ -11,14 +11,17 @@ import {
 } from "react-native";
 import { Picker } from "@react-native-picker/picker";
 import * as ImagePicker from "expo-image-picker";
+import { useRouter } from "expo-router";
 import { signOut } from "firebase/auth";
 import { onValue, ref, update } from "firebase/database";
 import { auth, db } from "../../firebase";
+import { clearRememberedCredentials } from "../../utils/rememberMe";
 
 const defaultUser = require("../../assets/default-user.png");
 
 export default function SettingsScreen() {
   const user = auth.currentUser;
+  const router = useRouter();
 
   const [username, setUsername] = useState("");
   const [age, setAge] = useState("");
@@ -30,6 +33,7 @@ export default function SettingsScreen() {
   const [ratingAvg, setRatingAvg] = useState(0);
   const [ratingCount, setRatingCount] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState("");
 
   useEffect(() => {
     if (!user) return;
@@ -101,6 +105,7 @@ export default function SettingsScreen() {
     }
 
     setSaving(true);
+    setSaveMessage("");
 
     try {
       const imageUrl = await uploadImage();
@@ -116,11 +121,23 @@ export default function SettingsScreen() {
 
       setPhoto(imageUrl);
       setLocalImage("");
-      Alert.alert("Profile saved");
+      setSaveMessage("Profile saved");
+      Alert.alert("Profile saved", "Your profile details were updated.");
     } catch (e: any) {
       Alert.alert("Unable to save profile", e.message);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleSignOut() {
+    try {
+      await clearRememberedCredentials();
+      await signOut(auth);
+    } catch (error: any) {
+      Alert.alert("Signed out locally", error?.message || "Returning to login.");
+    } finally {
+      router.replace("/login");
     }
   }
 
@@ -201,7 +218,12 @@ export default function SettingsScreen() {
         <Text style={styles.primaryText}>{saving ? "Saving..." : "Save profile"}</Text>
       </TouchableOpacity>
 
-      <TouchableOpacity style={styles.secondaryButton} onPress={() => signOut(auth)}>
+      {saveMessage ? <Text style={styles.saveMessage}>{saveMessage}</Text> : null}
+
+      <TouchableOpacity
+        style={styles.secondaryButton}
+        onPress={handleSignOut}
+      >
         <Text style={styles.secondaryText}>Sign out</Text>
       </TouchableOpacity>
     </ScrollView>
@@ -277,6 +299,12 @@ const styles = StyleSheet.create({
   },
   primaryText: {
     color: "#ffffff",
+    fontWeight: "900",
+  },
+  saveMessage: {
+    marginTop: 10,
+    textAlign: "center",
+    color: "#16a34a",
     fontWeight: "900",
   },
   secondaryButton: {

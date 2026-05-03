@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AppState } from "react-native";
 import * as Location from "expo-location";
 import {
   equalTo,
@@ -26,11 +27,25 @@ import type {
 
 const LOCATION_INTERVAL_MS = 3000;
 const LOCATION_DISTANCE_M = 8;
-const STALE_LOCATION_MS = 2 * 60 * 1000;
+const LOCATION_HEARTBEAT_MS = 5000;
+const STALE_LOCATION_MS = 5 * 60 * 1000;
 export const SOS_AUTO_CLEAR_MS = 2 * 60 * 1000;
+const DEFAULT_LOCATION: LatLng = {
+  latitude: 12.9716,
+  longitude: 77.5946,
+};
 
 function now() {
   return Date.now();
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return Promise.race([
+    promise,
+    new Promise<null>((resolve) => {
+      setTimeout(() => resolve(null), timeoutMs);
+    }),
+  ]);
 }
 
 function toLocation(id: string, value: any): LiveLocation | null {
@@ -66,16 +81,26 @@ function toProfile(id: string, value: any): UserProfile {
 
 export function useCurrentLocationPresence() {
   const user = auth.currentUser;
+  const uid = user?.uid;
   const [location, setLocation] = useState<LatLng | null>(null);
   const [permissionDenied, setPermissionDenied] = useState(false);
 
   useEffect(() => {
-    if (!user) return;
+    if (!uid) return;
 
-    const myLocationRef = ref(db, `locations/${user.uid}`);
-    const myStatusRef = ref(db, `status/${user.uid}`);
+    const myLocationRef = ref(db, `locations/${uid}`);
+    const myStatusRef = ref(db, `status/${uid}`);
     let subscription: Location.LocationSubscription | null = null;
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
     let mounted = true;
+    const currentRef = { current: null as LatLng | null };
+
+    async function publish(next: LatLng) {
+      currentRef.current = next;
+      setLocation(next);
+      await update(myLocationRef, { ...next, updatedAt: now() });
+      await update(myStatusRef, { state: "online", updatedAt: now() });
+    }
 
     onDisconnect(myStatusRef).set({ state: "offline", updatedAt: now() });
     onDisconnect(myLocationRef).remove();
@@ -90,19 +115,35 @@ export function useCurrentLocationPresence() {
         return;
       }
 
-      const first = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.High,
+      const lastKnown = await Location.getLastKnownPositionAsync({
+        maxAge: 10 * 60 * 1000,
+        requiredAccuracy: 5000,
       });
 
       if (!mounted) return;
 
-      const initial = {
-        latitude: first.coords.latitude,
-        longitude: first.coords.longitude,
-      };
+      await publish(
+        lastKnown
+          ? {
+              latitude: lastKnown.coords.latitude,
+              longitude: lastKnown.coords.longitude,
+            }
+          : DEFAULT_LOCATION
+      );
 
-      setLocation(initial);
-      await set(myLocationRef, { ...initial, updatedAt: now() });
+      const first = await withTimeout(
+        Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.High,
+        }),
+        5000
+      );
+
+      if (first && mounted) {
+        await publish({
+          latitude: first.coords.latitude,
+          longitude: first.coords.longitude,
+        });
+      }
 
       subscription = await Location.watchPositionAsync(
         {
@@ -111,26 +152,33 @@ export function useCurrentLocationPresence() {
           distanceInterval: LOCATION_DISTANCE_M,
         },
         (next) => {
-          const current = {
+          publish({
             latitude: next.coords.latitude,
             longitude: next.coords.longitude,
-          };
-          setLocation(current);
-          update(myLocationRef, { ...current, updatedAt: now() });
-          update(myStatusRef, { state: "online", updatedAt: now() });
+          });
         }
       );
+
+      heartbeat = setInterval(() => {
+        if (!currentRef.current) return;
+        publish(currentRef.current);
+      }, LOCATION_HEARTBEAT_MS);
     }
 
     start();
 
+    const appStateSubscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active" || !currentRef.current) return;
+      publish(currentRef.current);
+    });
+
     return () => {
       mounted = false;
       subscription?.remove();
-      set(myStatusRef, { state: "offline", updatedAt: now() });
-      remove(myLocationRef);
+      appStateSubscription.remove();
+      if (heartbeat) clearInterval(heartbeat);
     };
-  }, [user]);
+  }, [uid]);
 
   return { location, permissionDenied };
 }
@@ -158,19 +206,18 @@ export function useProfiles() {
 
 export function useLiveLocations() {
   const user = auth.currentUser;
+  const uid = user?.uid;
   const [locations, setLocations] = useState<Record<string, LiveLocation>>({});
-  const [status, setStatus] = useState<Record<string, any>>({});
 
   useEffect(() => {
     const locationsRef = ref(db, "locations");
-    const statusRef = ref(db, "status");
 
     const unsubscribeLocations = onValue(locationsRef, (snapshot) => {
       const value = snapshot.val() || {};
       const next: Record<string, LiveLocation> = {};
 
       Object.keys(value).forEach((id) => {
-        if (id === user?.uid) return;
+        if (id === uid) return;
         const parsed = toLocation(id, value[id]);
         if (parsed) next[id] = parsed;
       });
@@ -178,27 +225,18 @@ export function useLiveLocations() {
       setLocations(next);
     });
 
-    const unsubscribeStatus = onValue(statusRef, (snapshot) => {
-      setStatus(snapshot.val() || {});
-    });
-
     return () => {
       unsubscribeLocations();
-      unsubscribeStatus();
     };
-  }, [user?.uid]);
+  }, [uid]);
 
   return useMemo(() => {
     const cutoff = now() - STALE_LOCATION_MS;
 
-    return Object.values(locations).filter((location) => {
-      const userStatus = status[location.id];
-      const state =
-        typeof userStatus === "string" ? userStatus : userStatus?.state || "online";
-
-      return state !== "offline" && (!location.updatedAt || location.updatedAt > cutoff);
-    });
-  }, [locations, status]);
+    return Object.values(locations).filter(
+      (location) => !location.updatedAt || location.updatedAt > cutoff
+    );
+  }, [locations]);
 }
 
 export function useSosController(currentLocation: LatLng | null) {
@@ -242,11 +280,21 @@ export function useSosController(currentLocation: LatLng | null) {
     async (message?: string) => {
       if (!user || !currentLocation) return;
 
-      await set(ref(db, `sos/${user.uid}`), {
+      const next = {
+        id: user.uid,
         latitude: currentLocation.latitude,
         longitude: currentLocation.longitude,
         time: now(),
         message: message || "Emergency help needed",
+      };
+
+      setAlerts((current) => ({ ...current, [user.uid]: next }));
+
+      await set(ref(db, `sos/${user.uid}`), {
+        latitude: next.latitude,
+        longitude: next.longitude,
+        time: next.time,
+        message: next.message,
       });
     },
     [currentLocation, user]
@@ -254,6 +302,11 @@ export function useSosController(currentLocation: LatLng | null) {
 
   const clearSOS = useCallback(async () => {
     if (!user) return;
+    setAlerts((current) => {
+      const next = { ...current };
+      delete next[user.uid];
+      return next;
+    });
     await remove(ref(db, `sos/${user.uid}`));
   }, [user]);
 
